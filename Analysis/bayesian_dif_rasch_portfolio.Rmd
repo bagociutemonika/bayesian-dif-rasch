@@ -1,0 +1,1497 @@
+---
+title: "Bayesian Detection of Differential Item Functioning Under the Rasch Model"
+author: "Monika Bagociute"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+---
+
+## Research overview
+
+This project investigates the detection of Differential Item Functioning (DIF)
+under the Rasch model using Bayesian estimation.
+
+The analysis has two components. First, a simulation study evaluates whether a
+custom Metropolis–Hastings sampler can recover known DIF parameters and compares
+its estimates with those obtained from JAGS. Second, the Bayesian approach is
+applied to an empirical assessment dataset and compared with the classical
+Mantel–Haenszel procedure.
+
+### Research question
+
+Can Bayesian estimation reliably detect DIF under the Rasch model, and how do
+the results compare with a classical DIF detection procedure?
+
+### Analytical workflow
+
+The analysis demonstrates:
+
+- Simulation-based validation of a statistical estimation procedure
+- Bayesian parameter estimation using Metropolis–Hastings MCMC
+- Validation against JAGS
+- Posterior means and credible intervals
+- MCMC diagnostics, including trace and autocorrelation plots
+- Empirical DIF analysis
+- Comparison of Bayesian and Mantel–Haenszel results
+- Bayesian hypothesis testing
+
+### Tools
+
+- R
+- R Markdown
+- JAGS
+- Metropolis–Hastings MCMC
+- Bayesian estimation
+- Rasch modelling
+- DIF analysis
+
+
+
+#### Simulation 
+
+Data were simulated under a Rasch model. The dataset consisted of 500 participants responding to 10 dichotomous items. Participants were randomly assigned to one of two groups, which may be interpreted, for example, as boys and girls. Differential Item Functioning (DIF) was introduced for Items 3 and 8 by allowing group membership to affect the probability of a correct response, whereas the remaining items were assumed to function equivalently across groups.
+
+```{r data}
+
+
+
+library(rjags)
+library(coda)
+#library(difR)
+library(bain)
+library(restriktor)
+library(knitr)
+library(xtable)
+
+set.seed(123456)
+
+# persons
+N <- 500 
+# items
+J <- 10       
+
+# assign them randomly to a group
+group <- rbinom(n = N, size = 1, prob = .50)
+table(group)
+
+# draw the ability estimates from the normal distrib,
+theta <- rnorm(n = N, mean = 0, sd = 1)
+#theta
+# draw the difficulty parameters from the normal distrib.
+b <- rnorm(n = J, mean = 0, sd = 1)
+#b
+
+# Introducing DIF
+delta <- rep(0, J)
+
+# item 3 harder
+delta[3] <- 1
+
+# Item 8 easier 
+delta[8] <- -1
+
+#delta
+
+```
+We continue generating the responses.
+
+```{r}
+
+# response matrix (empti)
+Y <- matrix(0, nrow = N, ncol = J) 
+#Y
+
+# generating responses
+for(i in 1:N){
+for(j in 1:J){
+eta <-theta[i] -b[j] - delta[j] * group[i] 
+p <- plogis(eta) # rasch function 
+Y[i,j] <- rbinom(n = 1, size = 1, prob = p)
+  }
+}
+
+# check up 
+dim(Y) # correct dim
+
+round(colMeans(Y), 3) # we see the % of responding correctly
+
+
+rbind(
+  Reference = colMeans(Y[group == 0, ]),
+  Focal = colMeans(Y[group == 1, ])
+) # for item 3 and item 8 we see a clear difference
+
+
+
+```
+The simulated data seems correct. 
+
+```{r}
+
+# storing
+simdata <- list(Y = Y, theta_true = theta, b_true = b, delta_true = delta,
+  group = group
+)
+
+saveRDS(
+  simdata,
+  "../Data/processed/simulated_rasch_dif.rds"
+)
+```
+
+
+Theoretical curves using the generating mechanism. I am using this information for my final report only. 
+```{r}
+
+pdf("../Figures/theoretical_item_response_curves.pdf",
+    width = 12,
+    height = 7)
+
+par(mfrow = c(2, 5))
+
+theta_grid <- seq(-3, 3, length.out = 200)
+
+for (j in 1:J) {
+
+  p_ref <- plogis(theta_grid - b[j])
+
+  p_focal <- plogis(
+    theta_grid - b[j] - delta[j]
+  )
+
+  plot(
+    theta_grid,
+    p_ref,
+    type = "l",
+    ylim = c(0, 1),
+    main = paste("Item", j),
+    xlab = "Theta",
+    ylab = "P"
+  )
+
+  lines(
+    theta_grid,
+    p_focal,
+    lty = 2
+  )
+}
+
+dev.off()
+```
+
+
+#### JAGS
+
+Since the true values of the item and DIF parameters are known in the simulated data, agreement between the estimates obtained from the JAGS and Metropolis-Hastings sampler provides evidence that the implemented algorithm correctly approximates the posterior distributions.
+
+
+```{r}
+
+
+model_string <- "
+model{
+
+for(i in 1:N){
+
+for(j in 1:J){
+
+Y[i,j] ~ dbern(p[i,j])
+
+logit(p[i,j]) <- theta[i] - b[j] - delta[j]*group[i]} }
+
+  # Priors
+
+for(j in 1:J){
+
+b[j] ~ dnorm(0,1)
+
+delta[j] ~ dnorm(0,1)}}
+"
+
+```
+
+
+Data for JAGS
+
+```{r}
+library(rjags)
+
+jags_data <- list(
+Y = Y,
+N = N,
+J = J,
+group = group, 
+theta = theta
+
+)
+
+
+```
+
+Initial values
+
+```{r}
+inits <- function(){
+list(b = rnorm(J,0,1), delta = rep(0,J))
+}
+
+```
+
+Fitting the model 
+
+```{r}
+
+mod <- jags.model(
+  textConnection(model_string),
+  data = jags_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 2000
+)
+
+```
+
+```{r}
+# burn-in
+update(mod, 5000) # takes some time
+
+# draw posterior samples
+
+library(coda)
+
+samples <- coda.samples(model = mod, variable.names = c("b","delta"), n.iter = 10000)
+
+```
+Extract JAGS estimates
+```{r}
+summary(samples)
+
+stats <- summary(samples)$statistics
+delta_rows <- grep("^delta", rownames(stats))
+delta_est <- stats[delta_rows,"Mean"]
+delta_est
+
+
+```
+
+
+
+
+####  MH sampler 
+
+
+```{r}
+
+set.seed(123)
+
+
+n_iter <- 10000
+burnin <- 2000
+
+
+prop_b <- 0.3
+prop_delta <- 0.3
+
+
+# Initial values
+b_mh <- rep(0, J)
+delta_mh <- rep(0, J)
+
+
+# Storage
+
+b_store <- matrix(NA, n_iter, J)
+delta_store <- matrix(NA, n_iter, J)
+
+# vectors count how many proposals are accepted for each item
+acc_b <- rep(0, J)
+acc_delta <- rep(0, J)
+```
+
+Log likelihood for a single item
+
+```{r}
+
+loglik_item <- function(b, delta, y, theta, group){
+eta <- theta - b - delta*group
+p <- plogis(eta)
+sum(y*log(p) + (1-y)*log(1-p)) # we turned products into sums, computationally easier
+}
+
+```
+
+Prior
+
+```{r}
+
+logprior <- function(x){dnorm(x, mean = 0, sd = 1, log = TRUE)
+}
+
+```
+
+
+```{r}
+
+
+for(iter in 1:n_iter){
+
+# update b
+  for(j in 1:J){
+ # Propose new difficulty
+b_prop <- rnorm(1, mean = b_mh[j],sd = prop_b)
+# Current log-posterior
+logpost_current <-loglik_item( b = b_mh[j],delta = delta_mh[j],y = Y[,j],theta = theta,group = group) +logprior(b_mh[j])
+# Proposed log-posterior
+logpost_prop <-loglik_item(b = b_prop, delta = delta_mh[j],y = Y[,j],theta = theta,group = group) +logprior(b_prop)
+# Log acceptance ratio
+log_alpha <-logpost_prop -logpost_current
+# Accept or reject
+if(log(runif(1)) < log_alpha){
+b_mh[j] <- b_prop
+acc_b[j] <- acc_b[j] + 1
+}
+
+  }
+
+  # update DIF param.
+
+
+  for(j in 1:J){
+# Propose new DIF parameter
+delta_prop <- rnorm(1, mean = delta_mh[j],sd = prop_delta)
+# Current log-posterior
+logpost_current <-loglik_item(b = b_mh[j],delta = delta_mh[j],y = Y[,j],theta = theta,group = group) +
+      logprior(delta_mh[j])
+
+# Proposed log-posterior
+logpost_prop <-loglik_item(b = b_mh[j],delta = delta_prop,y = Y[,j],theta = theta,group = group) +logprior(delta_prop)
+
+# Log acceptance ratio
+log_alpha <-logpost_prop -logpost_current
+# Accept or reject
+if(log(runif(1)) < log_alpha){
+
+delta_mh[j] <- delta_prop
+
+acc_delta[j] <- acc_delta[j] + 1
+
+    }
+
+  }
+
+  # store samples
+ 
+
+  b_store[iter, ] <- b_mh
+
+  delta_store[iter, ] <- delta_mh
+
+}
+
+```
+Acceptance Rates
+```{r}
+acc_rate_b <- acc_b / n_iter
+acc_rate_delta <- acc_delta / n_iter
+
+acc_rate_b
+acc_rate_delta
+
+
+```
+
+Posterior Summaries
+
+```{r}
+
+delta_post <- delta_store[ (burnin + 1):n_iter,]
+
+
+delta_mean <- apply(
+  delta_post,
+  2,
+  mean
+)
+
+```
+
+CI 
+
+```{r}
+
+delta_ci <- apply(
+  delta_post,
+  2,
+  quantile,
+  probs = c(0.025, 0.975)
+)
+
+```
+
+
+Results
+
+```{r}
+
+results <- data.frame(
+
+  Item = 1:J,
+
+  True_DIF = delta,
+
+  Posterior_Mean = round(
+    delta_mean,
+    3
+  ),
+
+  Lower95 = round(
+    delta_ci[1,],
+    3
+  ),
+
+  Upper95 = round(
+    delta_ci[2,],
+    3
+  )
+
+)
+
+results
+
+```
+
+Trace plots
+```{r}
+
+pdf(
+  "../Figures/mh_trace_plots.pdf",
+  width = 9,
+  height = 7
+)
+
+par(mfrow = c(2, 2))
+
+plot(
+  delta_store[, 3],
+  type = "l",
+  main = expression(delta[3]),
+  xlab = "Iteration",
+  ylab = "DIF parameter"
+)
+
+plot(
+  delta_store[, 8],
+  type = "l",
+  main = expression(delta[8]),
+  xlab = "Iteration",
+  ylab = "DIF parameter"
+)
+
+plot(
+  delta_store[, 1],
+  type = "l",
+  main = expression(delta[1]),
+  xlab = "Iteration",
+  ylab = "DIF parameter"
+)
+
+plot(
+  delta_store[, 2],
+  type = "l",
+  main = expression(delta[2]),
+  xlab = "Iteration",
+  ylab = "DIF parameter"
+)
+
+dev.off()
+```
+
+
+
+
+Some tables for the results 
+
+```{r}
+# JAGS estimates of delta
+
+stats <- summary(samples)$statistics
+
+delta_rows <- grep("^delta", rownames(stats))
+
+delta_est <- stats[delta_rows, "Mean"]
+
+delta_est
+
+```
+
+table
+```{r}
+
+
+comparison_table <- data.frame(
+
+  Item = 1:J,
+
+  True_DIF = delta,
+
+  MH = round(delta_mean, 3),
+
+  JAGS = round(delta_est, 3)
+
+)
+
+comparison_table
+
+```
+
+plot 
+```{r}
+pdf(
+  "../Figures/mh_vs_jags_estimates.pdf",
+  width = 7,
+  height = 6
+)
+
+plot(
+  delta_est,
+  delta_mean,
+  pch = 19,
+  xlab = "JAGS estimate",
+  ylab = "MH estimate",
+  main = "Metropolis–Hastings versus JAGS"
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2
+)
+
+text(
+  delta_est,
+  delta_mean,
+  labels = 1:J,
+  pos = 3
+)
+
+dev.off()
+
+```
+Acceptance rate
+
+```{r}
+
+acceptance_table <- data.frame(
+
+  Item = 1:J,
+
+  Difficulty = round(acc_rate_b,3),
+
+  DIF = round(acc_rate_delta,3)
+
+)
+
+library(knitr)
+
+kable(
+  acceptance_table,
+  caption = "Acceptance rates of the Metropolis--Hastings algorithm."
+)
+
+
+```
+
+
+autocorrelation plots
+
+```{r}
+
+pdf(
+  "../Figures/mh_autocorrelation_plots.pdf",
+  width = 9,
+  height = 5
+)
+
+par(mfrow = c(1, 2))
+
+acf(
+  delta_post[, 3],
+  main = expression(delta[3]),
+  xlab = "Lag"
+)
+
+acf(
+  delta_post[, 8],
+  main = expression(delta[8]),
+  xlab = "Lag"
+)
+
+dev.off()
+
+```
+
+acceptance ratio
+
+```{r}
+
+
+acceptance_table <- data.frame(
+
+  Item = 1:J,
+
+  Difficulty = round(acc_rate_b,3),
+
+  DIF = round(acc_rate_delta,3)
+
+)
+
+acceptance_table
+
+```
+
+Comparing with JAGS
+
+```{r}
+comparison_table <- data.frame(
+
+  Item = 1:J,
+
+  True_DIF = delta,
+
+  MH = round(delta_mean,3),
+
+  JAGS = round(delta_est,3)
+
+)
+
+comparison_table
+
+
+```
+
+### Practical usefulness
+
+the method is validated, now is the time to apply it
+
+
+
+
+
+#### Empirical data 
+
+```{r}
+library(difR)
+
+data(package = "difR")
+
+```
+
+```{r}
+
+
+data(verbal)
+```
+
+```{r}
+
+str(verbal)
+names(verbal)
+```
+
+response matrix
+
+```{r}
+Y_verbal <- as.matrix(verbal[,1:24])
+
+dim(Y_verbal)
+```
+
+Group variable 
+
+```{r}
+
+table(verbal$Gender)
+
+group_verbal <- verbal$Gender
+```
+
+```{r}
+
+round(colMeans(Y_verbal),3)
+
+```
+
+Classical DIF
+
+```{r}
+library(difR)
+
+mh_verbal <- difMH(
+  Data = Y_verbal,
+  group = group_verbal,
+  focal.name = 1
+)
+
+mh_verbal$DIFitems
+
+```
+
+```{r}
+mh_table <- data.frame(
+  Item = 1:24,
+  p_value = round(mh_verbal$p.value,4),
+  alphaMH = round(mh_verbal$alphaMH,3)
+)
+
+mh_table
+
+
+```
+
+
+Ability estimates (proxy)
+
+
+```{r}
+theta_verbal <- scale(rowSums(Y_verbal))
+
+```
+
+
+MH sampler
+Follow the same as before, the main thing I did now is that I have adjusted J into J_verbal
+
+```{r}
+set.seed(123)
+
+n_iter <- 10000
+burnin <- 2000
+
+prop_b <- 0.3
+prop_delta <- 0.3
+
+N_verbal <- nrow(Y_verbal)
+J_verbal <- ncol(Y_verbal)
+
+```
+
+```{r}
+b_mh <- rep(0, J_verbal)
+delta_mh <- rep(0, J_verbal)
+
+```
+
+```{r}
+
+b_store <- matrix(NA, n_iter, J_verbal)
+delta_store <- matrix(NA, n_iter, J_verbal)
+
+acc_b <- rep(0, J_verbal)
+acc_delta <- rep(0, J_verbal)
+
+```
+
+Log likelihood
+
+```{r}
+loglik_item <- function(b, delta, y, theta, group){
+
+  eta <- theta - b - delta*group
+
+  p <- plogis(eta)
+
+  sum(y*log(p) +(1-y)*log(1-p))
+
+}
+
+```
+
+Prior Distribution
+
+```{r}
+logprior <- function(x){
+
+  dnorm(
+    x,
+    mean = 0,
+    sd = 1,
+    log = TRUE
+  )
+
+}
+
+```
+
+Metropolis-Hastings
+
+```{r}
+
+for(iter in 1:n_iter){
+  for(j in 1:J_verbal){
+
+    b_prop <- rnorm(1, mean = b_mh[j], sd = prop_b)
+logpost_current <-loglik_item(b_mh[j],delta_mh[j],Y_verbal[,j],theta_verbal,
+        group_verbal) +
+      logprior(b_mh[j])
+
+    logpost_prop <-
+      loglik_item(b_prop,delta_mh[j],Y_verbal[,j],theta_verbal,group_verbal
+      ) +
+      logprior(b_prop)
+
+    if(
+      log(runif(1)) <
+      (logpost_prop - logpost_current)
+    ){
+
+      b_mh[j] <- b_prop
+
+      acc_b[j] <- acc_b[j] + 1
+
+    }
+
+  }
+
+
+  # for DIF 
+
+  for(j in 1:J_verbal){
+
+    delta_prop <- rnorm(1,mean = delta_mh[j],sd = prop_delta)
+
+    logpost_current <-loglik_item(b_mh[j],delta_mh[j],Y_verbal[,j],theta_verbal,group_verbal
+      ) +
+      logprior(
+        delta_mh[j]
+      )
+
+    logpost_prop <-
+      loglik_item(
+        b_mh[j],
+        delta_prop,
+        Y_verbal[,j],
+        theta_verbal,
+        group_verbal
+      ) +
+      logprior(
+        delta_prop
+      )
+
+    if(
+      log(runif(1)) <
+      (logpost_prop - logpost_current)
+    ){
+
+      delta_mh[j] <- delta_prop
+
+      acc_delta[j] <- acc_delta[j] + 1
+
+    }
+
+  }
+
+
+
+  b_store[iter,] <- b_mh
+
+  delta_store[iter,] <- delta_mh
+
+}
+
+
+```
+
+
+Acceptance rate
+
+```{r}
+
+acc_rate_b <- acc_b / n_iter
+acc_rate_delta <- acc_delta / n_iter
+
+acc_rate_b
+acc_rate_delta
+```
+
+Posterior summaries
+
+```{r}
+delta_post <- delta_store[
+  (burnin+1):n_iter,
+]
+
+```
+
+Posterior mean
+
+```{r}
+delta_mean <- apply(
+  delta_post,
+  2,
+  mean
+)
+
+```
+
+CI
+
+```{r}
+
+delta_ci <- apply(
+  delta_post,
+  2,
+  quantile, 
+  probs = c(0.025, 0.975)
+)
+
+dim(delta_ci)
+```
+
+Results table
+
+```{r}
+results_verbal <- data.frame(
+
+  Item = 1:J_verbal,
+
+  Posterior_Mean =
+    round(delta_mean,3),
+
+  Lower95 =
+    round(delta_ci[1,],3),
+
+  Upper95 =
+    round(delta_ci[2,],3)
+
+)
+
+results_verbal
+
+```
+Trace plots
+
+```{r}
+par(mfrow = c(2,1))
+
+plot(
+  delta_store[,1],
+  type="l",
+  main=expression(delta[1])
+)
+
+plot(
+  delta_store[,2],
+  type="l",
+  main=expression(delta[2])
+)
+
+plot(
+  delta_store[,3],
+  type="l",
+  main=expression(delta[3])
+)
+
+plot(
+  delta_store[,4],
+  type="l",
+  main=expression(delta[4])
+)
+
+```
+
+Combined table 
+
+```{r}
+
+combined_results <- data.frame(
+
+  Item = 1:J_verbal,
+
+  MH_p_value = round(mh_verbal$p.value, 4),
+
+  MH_alpha = round(mh_verbal$alphaMH, 3),
+
+  Posterior_Mean = round(delta_mean, 3),
+
+  Lower95 = round(delta_ci[1,], 3),
+
+  Upper95 = round(delta_ci[2,], 3)
+
+)
+
+combined_results$Bayesian_DIF <-
+  ifelse(
+    combined_results$Lower95 > 0 |
+    combined_results$Upper95 < 0,
+    "Yes",
+    "No"
+  )
+
+combined_results$MH_DIF <-
+  ifelse(
+    combined_results$MH_p_value < .05,
+    "Yes",
+    "No"
+  )
+
+combined_results
+
+write.csv(
+  combined_results,
+  "../Data/processed/empirical_dif_comparison.csv",
+  row.names = FALSE
+)
+
+```
+
+extract the tables for overleaf
+
+```{r}
+
+library(xtable)
+
+print(
+  xtable(combined_results,
+         caption = "Comparison of Mantel--Haenszel and Bayesian DIF results.",
+         label = "tab:empirical"),
+  include.rownames = FALSE
+)
+
+```
+
+#### hypothesis testing 
+
+
+```{r}
+library(bain)
+
+library(restriktor)
+
+```
+
+
+```{r}
+dat_goric <- data.frame(
+
+d6  = delta_post[,6],
+
+d16 = delta_post[,16],
+
+d17 = delta_post[,17],
+
+d19 = delta_post[,19]
+
+)
+
+
+```
+
+
+```{r}
+
+fit_goric <- lm(
+cbind(d6,d16,d17,d19) ~ 1,
+data = dat_goric
+)
+
+
+```
+
+
+
+
+```{r}
+dat <- data.frame(
+  d6 = delta_post[,6],
+  d16 = delta_post[,16],
+  d17 = delta_post[,17],
+  d19 = delta_post[,19]
+)
+
+fit <- lm(cbind(d6,d16,d17,d19) ~ 1, data = dat)
+
+```
+
+
+
+
+
+```{r}
+
+d6 <- delta_post[,6]
+
+d16 <- delta_post[, 16]
+
+d17 <- delta_post[, 17]
+
+d19 <- delta_post[, 19]
+
+```
+
+measurement invariance
+
+```{r}
+
+H1 <- mean(
+  abs(d6)  < 0.10 &
+  abs(d16) < 0.10 &
+  abs(d17) < 0.10 &
+  abs(d19) < 0.10
+)
+
+H1
+
+```
+Expected directions
+```{r}
+
+H2 <- mean(
+  d6  > 0 &
+  d16 < 0 &
+  d17 < 0 &
+  d19 < 0
+)
+
+H2
+
+```
+Ordered effects
+
+```{r}
+H3 <- mean(
+  d16 < d17 &
+  d17 < d19 &
+  d19 < 0 &
+  d6 > 0
+)
+
+H3
+
+
+
+```
+
+Summarise the results
+
+```{r}
+
+hypothesis_results <- data.frame(
+
+  Hypothesis = c(
+    "Measurement invariance",
+    "Directional DIF",
+    "Ordered DIF effects"
+  ),
+
+  Posterior_Probability = round(
+    c(H1, H2, H3),
+    3
+  )
+
+)
+
+hypothesis_results
+
+```
+
+Fit log regression for each item 
+
+```{r}
+fit6 <- glm(
+  Y_verbal[,6] ~ theta_verbal + group_verbal,
+  family = binomial
+)
+
+fit16 <- glm(
+  Y_verbal[,16] ~ theta_verbal + group_verbal,
+  family = binomial
+)
+
+fit17 <- glm(
+  Y_verbal[,17] ~ theta_verbal + group_verbal,
+  family = binomial
+)
+
+fit19 <- glm(
+  Y_verbal[,19] ~ theta_verbal + group_verbal,
+  family = binomial
+)
+
+
+
+```
+
+```{r}
+
+bain6 <- bain(
+  fit6,
+  "group_verbal = 0;
+   group_verbal > 0;
+   group_verbal < 0"
+)
+
+summary(bain6)
+
+
+```
+
+```{r}
+
+bain6$fit
+
+```
+
+
+```{r}
+
+bain16 <- bain(
+  fit16,
+  "group_verbal = 0;
+   group_verbal < 0;
+   group_verbal > 0"
+)
+
+bain17 <- bain(
+  fit17,
+  "group_verbal = 0;
+   group_verbal < 0;
+   group_verbal > 0"
+)
+
+bain19 <- bain(
+  fit19,
+  "group_verbal = 0;
+   group_verbal < 0;
+   group_verbal > 0"
+)
+
+
+
+summary(bain16)
+summary(bain17)
+summary(bain19)
+```
+
+
+full table
+
+```{r}
+
+hypothesis_results <- data.frame(
+
+  Item = c(6,16,17,19),
+
+  No_DIF = c(
+    bain6$fit["H1","Fit_eq"],
+    bain16$fit["H1","Fit_eq"],
+    bain17$fit["H1","Fit_eq"],
+    bain19$fit["H1","Fit_eq"]
+  ),
+
+  Expected_Direction = c(
+    bain6$fit["H2","Fit_in"],
+    bain16$fit["H2","Fit_in"],
+    bain17$fit["H2","Fit_in"],
+    bain19$fit["H2","Fit_in"]
+  ),
+
+  Opposite_Direction = c(
+    bain6$fit["H3","Fit_in"],
+    bain16$fit["H3","Fit_in"],
+    bain17$fit["H3","Fit_in"],
+    bain19$fit["H3","Fit_in"]
+  )
+
+)
+
+round(hypothesis_results,3)
+
+
+```
+
+
+```{r}
+hypothesis_results <- data.frame(
+
+  Item = c(6,16,17,19),
+
+  No_DIF = c(
+    bain6$fit["H1","Fit_eq"],
+    bain16$fit["H1","Fit_eq"],
+    bain17$fit["H1","Fit_eq"],
+    bain19$fit["H1","Fit_eq"]
+  ),
+
+  Expected_DIF = c(
+    bain6$fit["H2","Fit_in"],
+    bain16$fit["H2","Fit_in"],
+    bain17$fit["H2","Fit_in"],
+    bain19$fit["H2","Fit_in"]
+  ),
+
+  Opposite_DIF = c(
+    bain6$fit["H3","Fit_in"],
+    bain16$fit["H3","Fit_in"],
+    bain17$fit["H3","Fit_in"],
+    bain19$fit["H3","Fit_in"]
+  )
+
+)
+
+round(hypothesis_results,3)
+
+
+```
+
+Using PMPb
+
+```{r}
+hypothesis_results <- data.frame(
+
+Item = c(6,16,17,19),
+
+No_DIF = c(
+bain6$fit["H1","PMPb"],
+bain16$fit["H1","PMPb"],
+bain17$fit["H1","PMPb"],
+bain19$fit["H1","PMPb"]
+),
+
+Expected_DIF = c(
+bain6$fit["H2","PMPb"],
+bain16$fit["H2","PMPb"],
+bain17$fit["H2","PMPb"],
+bain19$fit["H2","PMPb"]
+),
+
+Opposite_DIF = c(
+bain6$fit["H3","PMPb"],
+bain16$fit["H3","PMPb"],
+bain17$fit["H3","PMPb"],
+bain19$fit["H3","PMPb"]
+)
+
+)
+
+round(hypothesis_results,3)
+
+```
+
+```{r}
+
+hypothesis_results <- data.frame(
+
+Item = c(6,16,17,19),
+
+No_DIF = c(
+bain6$fit["H1","PMPb"],
+bain16$fit["H1","PMPb"],
+bain17$fit["H1","PMPb"],
+bain19$fit["H1","PMPb"]
+),
+
+Expected_DIF = c(
+bain6$fit["H2","PMPb"],
+bain16$fit["H2","PMPb"],
+bain17$fit["H2","PMPb"],
+bain19$fit["H2","PMPb"]
+),
+
+Opposite_DIF = c(
+bain6$fit["H3","PMPb"],
+bain16$fit["H3","PMPb"],
+bain17$fit["H3","PMPb"],
+bain19$fit["H3","PMPb"]
+),
+
+Unconstrained = c(
+bain6$fit["Hu","PMPb"],
+bain16$fit["Hu","PMPb"],
+bain17$fit["Hu","PMPb"],
+bain19$fit["Hu","PMPb"]
+)
+
+)
+
+round(hypothesis_results,3)
+
+
+```
+
+Table for overleaf
+
+```{r}
+
+library(xtable)
+
+print(
+xtable(
+hypothesis_results,
+caption = "Posterior model probabilities obtained from Bayesian hypothesis testing.",
+label = "tab:bain"
+),
+include.rownames = FALSE
+)
+
+```
+
+GORIC
+
+
+```{r}
+
+beta <- c(
+  delta_mean[6],
+  delta_mean[16],
+  delta_mean[17],
+  delta_mean[19]
+)
+
+names(beta) <- c("d6","d16","d17","d19")
+
+beta
+
+```
+
+
+```{r}
+
+Sigma <- cov(
+  delta_post[, c(6,16,17,19)]
+)
+
+Sigma
+
+```
+
+
+```{r}
+
+H1 <- "d6 = d16 = d17 = d19 = 0"
+H2 <- "
+d6 > 0
+d16 < 0
+d17 < 0
+d19 < 0
+"
+H3 <- "
+d16 < d17
+d17 < d19
+d19 < 0
+d6 > 0
+"
+H4 <- "
+d16 < d17
+d16 < d19
+d6 > 0
+"
+
+
+
+
+```
+
